@@ -1,21 +1,8 @@
-# AI Character with Dynamic Prompt
+# AI Character with Voice
 
-Create a cloud-hosted LLM Agent with custom personality that you, or users, can change dynamically via API.
+Create a cloud-hosted LLM Agent with custom personality, stable diffusion capabilities, and voice responses.
 
 This repository is designed to pair with [this Agent Building Guidebook](https://docs.steamship.com/agent-guidebook)
-
-## The Personality
-
-View the `api.py` file for full documentation on how the personality is defined, parameterized, and used with the agent:
-
-* The `DynamicPromptArguments` class, which defines the parameters
-* The `to_system_prompt` method, which turns those parameters into a system prompt
-* The `__init__` method, in which the saved personality is loaded and sets the Agent's system prompt
-* The `set_prompt_arguments` method, which allows one to set new values for `DynamicPromptArguments`
-
-The best way to try this agent out is to deploy it and then create a new instance on the web. Then, visit the 
-**API Tab** of your agent instance's management console and run the `set_prompt_arguments` method to set a new
-personality. Finally, visit the **Chat** tab to chat with this new personality.
 
 ## Getting Started
 
