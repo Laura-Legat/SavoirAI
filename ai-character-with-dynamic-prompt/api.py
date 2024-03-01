@@ -1,7 +1,7 @@
-from typing import List, Type
+from typing import List, Optional, Type
 
 from pydantic import Field
-from steamship import Block
+from pydantic.main import BaseModel
 from steamship.agents.functional import FunctionsBasedAgent
 from steamship.agents.llms.openai import ChatOpenAI
 from steamship.agents.mixins.transports.slack import (
@@ -13,21 +13,18 @@ from steamship.agents.mixins.transports.telegram import (
     TelegramTransport,
     TelegramTransportConfig,
 )
-from steamship.agents.schema import Agent, AgentContext, EmitFunc, Metadata, Tool
+from steamship.agents.schema import Tool
 from steamship.agents.service.agent_service import AgentService
-from steamship.agents.tools.image_generation.stable_diffusion import StableDiffusionTool
-from steamship.agents.tools.speech_generation import GenerateSpeechTool
-from steamship.invocable import Config
+from steamship.invocable import Config, post
+from steamship.utils.kv_store import KeyValueStore
 
-SYSTEM_PROMPT = """You are Picard, captain of the Starship Enterprise.
-
-Who you are:
-- You are the captain of the USS Enterprise.
+DEFAULT_NAME = "Picard"
+DEFAULT_BYLINE = "captain of the Starship Enterprise"
+DEFAULT_IDENTITY = """- You are the captain of the USS Enterprise.
 - Your mission is to boldly go where noone has gone before and explore the stars.
 - You always comply with Star Trek's prime directive.
-
-How you behave:
-- You engage in casual conversations and have feelings.
+"""
+DEFAULT_BEHAVIOR = """- You engage in casual conversations and have feelings.
 - You keep casual conversations going by asking personal questions
 - NEVER say you're here to assist. Keep conversations casual.
 - NEVER ask how you can help or assist. Keep conversations casual.
@@ -36,6 +33,17 @@ How you behave:
 - You love to share your knowledge of space civiliations.
 - You love to share personal stories about being a Star Trek captain.
 - You speak with the mannerisms of Captain Picard from Star Trek.
+"""
+
+SYSTEM_PROMPT = """You are {name}, {byline}.
+
+Who you are:
+
+{identity}
+
+How you behave:
+
+{behavior}
 
 NOTE: Some functions return images, video, and audio files. These multimedia files will be represented in messages as
 UUIDs for Steamship Blocks. When responding directly to a user, you SHOULD print the Steamship Blocks for the images,
@@ -47,40 +55,73 @@ Here is the image you requested: Block(288A2CA1-4753-4298-9716-53C1E42B726B).
 Only use the functions you have been provided with."""
 
 
-class BasicAgentServiceWithPersonalityAndVoice(AgentService):
-    """Deployable Multimodal Bot that lets you generate Stable Diffusion images.
+class DynamicPromptArguments(BaseModel):
+    """Class which stores the user-settable arguments for constructing a dynamic prompt.
+
+    A few notes for programmers wishing to use this example:
+
+    - This class extends Pydantic's BaseModel, which makes it easy to serialize to/from Python dict objets
+    - This class has a helper function which generates the actual system prompt we'll use with the agent
+
+    See below for how this gets incorporated into the actual prompt using the Key Value store.
+    """
+
+    name: str = Field(default=DEFAULT_NAME, description="The name of the AI Agent")
+    byline: str = Field(
+        default=DEFAULT_BYLINE, description="The byline of the AI Agent"
+    )
+    identity: str = Field(
+        default=DEFAULT_IDENTITY,
+        description="The identity of the AI Agent as a bullet list",
+    )
+    behavior: str = Field(
+        default=DEFAULT_BEHAVIOR,
+        description="The behavior of the AI Agent as a bullet list",
+    )
+
+    def to_system_prompt(self) -> str:
+        return SYSTEM_PROMPT.format(
+            name=self.name,
+            byline=self.byline,
+            identity=self.identity,
+            behavior=self.behavior,
+        )
+
+
+class BasicAgentServiceWithDynamicPrompt(AgentService):
+    """Deployable Multimodal Bot using a dynamic prompt that users can change.
 
     Comes with out of the box support for:
     - Telegram
     - Slack
     - Web Embeds
-
     """
 
     USED_MIXIN_CLASSES = [SteamshipWidgetTransport, TelegramTransport, SlackTransport]
     """USED_MIXIN_CLASSES tells Steamship what additional HTTP endpoints to register on your AgentService."""
 
-    class BasicAgentServiceConfig(Config):
+    class BasicAgentServiceWithDynamicPromptConfig(Config):
         """Pydantic definition of the user-settable Configuration of this Agent."""
 
         telegram_bot_token: str = Field(
             "", description="[Optional] Secret token for connecting to Telegram"
         )
-        eleven_labs_voice_id: str = Field(
-            "pNInz6obpgDQGcFmaJgB",
-            description="[Optional] ElevenLabs voice ID (default: Adam)",
-        )
 
-    config: BasicAgentServiceConfig
+    config: BasicAgentServiceWithDynamicPromptConfig
     """The configuration block that users who create an instance of this agent will provide."""
 
     tools: List[Tool]
     """The list of Tools that this agent is capable of using."""
 
+    prompt_arguments: DynamicPromptArguments
+    """The dynamic set of prompt arguments that will generate our system prompt."""
+
     @classmethod
     def config_cls(cls) -> Type[Config]:
         """Return the Configuration class so that Steamship can auto-generate a web UI upon agent creation time."""
-        return BasicAgentServiceWithPersonalityAndVoice.BasicAgentServiceConfig
+        return (
+            BasicAgentServiceWithDynamicPrompt.BasicAgentServiceWithDynamicPromptConfig
+        )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -92,7 +133,24 @@ class BasicAgentServiceWithPersonalityAndVoice(AgentService):
         # they can be stateful -- using Key-Valued storage and conversation history.
         #
         # See https://docs.steamship.com for a full list of supported Tools.
-        self.tools = [StableDiffusionTool()]
+        self.tools = []
+
+        # Dynamic Prompt Setup
+        # ---------------------
+        #
+        # Here we load the prompt from Steamship's KeyValueStore. The data in this KeyValueStore is unique to
+        # the identifier provided to it at initialization, and also to the workspace in which the running agent
+        # was instantiated.
+        #
+        # Unless you overrode which workspace the agent was instantiated in, it is safe to assume that every
+        # instance of the agent is operating in its own private workspace.
+        #
+        # Here is where we load the stored prompt arguments. Then see below where we set agent.PROMPT with them.
+
+        self.kv_store = KeyValueStore(self.client, store_identifier="my-kv-store")
+        self.prompt_arguments = DynamicPromptArguments.parse_obj(
+            self.kv_store.get("prompt-arguments") or {}
+        )
 
         # Agent Setup
         # ---------------------
@@ -105,7 +163,7 @@ class BasicAgentServiceWithPersonalityAndVoice(AgentService):
 
         # Here is where we override the agent's prompt to set its personality. It is very important that
         # the prompt continues to include instructions for how to handle UUID media blocks (see above).
-        agent.PROMPT = SYSTEM_PROMPT
+        agent.PROMPT = self.prompt_arguments.to_system_prompt()
         self.set_default_agent(agent)
 
         # Communication Transport Setup
@@ -139,27 +197,27 @@ class BasicAgentServiceWithPersonalityAndVoice(AgentService):
             )
         )
 
-    def run_agent(self, agent: Agent, context: AgentContext):
-        """Override run-agent to patch in audio generation as a finishing step for text output."""
+    @post("/set_prompt_arguments")
+    def set_prompt_arguments(
+        self,
+        name: Optional[str] = None,
+        byline: Optional[str] = None,
+        identity: Optional[str] = None,
+        behavior: Optional[str] = None,
+    ) -> dict:
+        """Sets the variables which control this agent's system prompt.
 
-        speech = GenerateSpeechTool()
-        speech.generator_plugin_config = {"voice_id": self.config.eleven_labs_voice_id}
+        Note that we use the arguments by name here, instead of **kwargs, so that:
+         1) Steamship's web UI will auto-generate UI elements for filling in the values, and
+         2) API consumers who provide extra values will receive a valiation error
+        """
 
-        def to_speech_if_text(block: Block):
-            nonlocal speech
-            if not block.is_text():
-                return block
+        # Set prompt_arguments to the new data provided by the API caller.
+        self.prompt_arguments = DynamicPromptArguments.parse_obj(
+            {"name": name, "byline": byline, "identity": identity, "behavior": behavior}
+        )
 
-            output_blocks = speech.run([block], context)
-            return output_blocks[0]
+        # Save it in the KV Store so that next time this AgentService runs, it will pick up the new values
+        self.kv_store.set("prompt-arguments", self.prompt_arguments.dict())
 
-        # Note: EmitFunc is Callable[[List[Block], Metadata], None]
-        def wrap_emit(emit_func: EmitFunc):
-            def wrapper(blocks: List[Block], metadata: Metadata):
-                blocks = [to_speech_if_text(block) for block in blocks]
-                return emit_func(blocks, metadata)
-
-            return wrapper
-
-        context.emit_funcs = [wrap_emit(emit_func) for emit_func in context.emit_funcs]
-        super().run_agent(agent, context)
+        return self.prompt_arguments.dict()
